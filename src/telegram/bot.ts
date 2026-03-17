@@ -144,17 +144,13 @@ export function createBot(): Bot {
             // Append model indicator
             const routeResult = getLastRouteResult();
             let indicatorSuffix = "";
-            if (routeResult) {
-              indicatorSuffix = routeResult.routerMode === "auto"
-                ? `\n\n_⚡ auto · ${routeResult.model}_`
-                : `\n\n_${routeResult.model}_`;
+            if (routeResult && routeResult.routerMode === "auto") {
+              indicatorSuffix = `\n\n_⚡ auto · ${routeResult.model}_`;
             }
             const formatted = toTelegramMarkdown(text) + indicatorSuffix;
             const chunks = chunkMessage(formatted);
-            const fallbackText = routeResult
-              ? text + (routeResult.routerMode === "auto"
-                  ? `\n\n⚡ auto · ${routeResult.model}`
-                  : `\n\n${routeResult.model}`)
+            const fallbackText = routeResult && routeResult.routerMode === "auto"
+              ? text + `\n\n⚡ auto · ${routeResult.model}`
               : text;
             const fallbackChunks = chunkMessage(fallbackText);
             const sendChunk = async (chunk: string, fallback: string, isFirst: boolean) => {
