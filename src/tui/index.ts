@@ -846,7 +846,9 @@ function cmdAuto(): void {
     if (!data) { rl.prompt(); return; }
     const newState = !data.enabled;
     apiPost("/auto", { enabled: newState }, () => {
-      const label = newState ? `${C.green("⚡")} auto on` : `auto off`;
+      const label = newState
+        ? `${C.green("⚡")} auto on`
+        : `auto off · using ${C.cyan(data.currentModel)}`;
       console.log(`  ${label}\n`);
     });
   });
