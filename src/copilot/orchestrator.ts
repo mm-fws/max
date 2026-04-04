@@ -5,10 +5,10 @@ import { config, DEFAULT_MODEL } from "../config.js";
 import { loadMcpConfig } from "./mcp-config.js";
 import { getSkillDirectories } from "./skills.js";
 import { resetClient } from "./client.js";
-import { logConversation, getState, setState, deleteState, getMemorySummary, getRecentConversation, getRelevantMemories, runMemoryMaintenance } from "../store/db.js";
+import { logConversation, getState, setState, deleteState, getRecentConversation, runMemoryMaintenance } from "../store/db.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
-import { extractAndSaveMemories } from "./memory-extractor.js";
+import { getRelevantWikiContext, getWikiSummary } from "../wiki/context.js";
 
 const MAX_RETRIES = 3;
 const RECONNECT_DELAYS_MS = [1_000, 3_000, 10_000];
@@ -164,7 +164,7 @@ async function ensureOrchestratorSession(): Promise<CopilotSession> {
 async function createOrResumeSession(): Promise<CopilotSession> {
   const client = await ensureClient();
   const { tools, mcpServers, skillDirectories } = getSessionConfig();
-  const memorySummary = getMemorySummary();
+  const wikiSummary = getWikiSummary();
 
   const infiniteSessions = {
     enabled: true,
@@ -182,7 +182,7 @@ async function createOrResumeSession(): Promise<CopilotSession> {
         configDir: SESSIONS_DIR,
         streaming: true,
         systemMessage: {
-          content: getOrchestratorSystemMessage(memorySummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
+          content: getOrchestratorSystemMessage(wikiSummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
         },
         tools,
         mcpServers,
@@ -206,7 +206,7 @@ async function createOrResumeSession(): Promise<CopilotSession> {
     configDir: SESSIONS_DIR,
     streaming: true,
     systemMessage: {
-      content: getOrchestratorSystemMessage(memorySummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
+      content: getOrchestratorSystemMessage(wikiSummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
     },
     tools,
     mcpServers,
@@ -221,14 +221,14 @@ async function createOrResumeSession(): Promise<CopilotSession> {
 
   // Recover conversation context if available (session was lost, not first run)
   const recentHistory = getRecentConversation(30);
-  const recoveryMemorySummary = getMemorySummary();
-  if (recentHistory || recoveryMemorySummary) {
-    console.log(`[max] Injecting recovery context into new session (${recentHistory ? "conversation + " : ""}${recoveryMemorySummary ? "memories" : ""})`);
+  const recoveryWikiSummary = getWikiSummary();
+  if (recentHistory || recoveryWikiSummary) {
+    console.log(`[max] Injecting recovery context into new session (${recentHistory ? "conversation + " : ""}${recoveryWikiSummary ? "wiki" : ""})`);
     const parts: string[] = [
       "[System: Session recovered] Your previous session was lost. Absorb this context silently — do NOT respond to it.",
     ];
-    if (recoveryMemorySummary) {
-      parts.push(`\n## Your Long-Term Memories:\n${recoveryMemorySummary}`);
+    if (recoveryWikiSummary) {
+      parts.push(`\n## Your Wiki Knowledge Base:\n${recoveryWikiSummary}`);
     }
     if (recentHistory) {
       parts.push(`\n## Recent Conversation (last 30 turns):\n${recentHistory}`);
@@ -294,16 +294,15 @@ async function executeOnSession(
   const session = await ensureOrchestratorSession();
   currentCallback = callback;
 
-  // Inject relevant memories into the prompt (skip for background task results)
+  // Inject relevant wiki context into the prompt (skip for background task results)
   let enrichedPrompt = prompt;
   if (!prompt.startsWith("[Background task completed]")) {
     try {
-      const relevant = getRelevantMemories(prompt, 5);
-      if (relevant.length > 0) {
-        const memBlock = relevant.join("; ");
-        // Cap at 500 chars to avoid prompt bloat
-        const trimmed = memBlock.length > 500 ? memBlock.slice(0, 500) + "…" : memBlock;
-        enrichedPrompt = `[Memory context: ${trimmed}]\n\n${prompt}`;
+      const wikiContext = getRelevantWikiContext(prompt, 3);
+      if (wikiContext) {
+        // Cap at 1500 chars to balance context richness vs prompt bloat
+        const trimmed = wikiContext.length > 1500 ? wikiContext.slice(0, 1500) + "…" : wikiContext;
+        enrichedPrompt = `[Wiki context:\n${trimmed}\n]\n\n${prompt}`;
       }
     } catch { /* non-fatal */ }
   }
@@ -440,10 +439,6 @@ export async function sendToOrchestrator(
         // Log both sides of the conversation after delivery
         try { logConversation(logRole, prompt, sourceLabel); } catch { /* best-effort */ }
         try { logConversation("assistant", finalContent, sourceLabel); } catch { /* best-effort */ }
-        // Silently extract memorable facts from user messages
-        if (logRole === "user") {
-          try { extractAndSaveMemories(prompt); } catch { /* best-effort */ }
-        }
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
