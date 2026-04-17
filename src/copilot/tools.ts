@@ -577,11 +577,15 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           writePage(pagePath, page);
         }
 
+        const indexTags: string[] = [args.category];
+        if (args.entity) indexTags.push(args.entity.toLowerCase());
         addToIndex({
           path: pagePath,
           title,
           summary: args.content.slice(0, 120),
           section: "Knowledge",
+          tags: indexTags,
+          updated: now,
         });
         appendLog("update", `remember (${args.category}${args.entity ? `, ${args.entity}` : ""}): ${args.content.slice(0, 80)}`);
 

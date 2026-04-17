@@ -9,13 +9,16 @@ export interface IndexEntry {
   title: string;
   summary: string;
   section: string;   // grouping header, e.g. "People", "Projects"
+  tags?: string[];   // extracted from page frontmatter
+  updated?: string;  // last updated date (YYYY-MM-DD)
 }
 
 /**
  * Parse index.md into structured entries.
- * Expected format:
+ * Expected format (new):
  *   ## Section Name
- *   - [Title](path) — Summary text
+ *   - [Title](path) — Summary text | tags: tag1, tag2 | updated: 2026-04-17
+ * Also supports legacy format without tags/updated.
  */
 export function parseIndex(): IndexEntry[] {
   const content = readIndexFile();
@@ -30,14 +33,35 @@ export function parseIndex(): IndexEntry[] {
       continue;
     }
 
-    // Entry lines: - [Title](path) — Summary
+    // Entry lines: - [Title](path) — Summary | tags: t1, t2 | updated: YYYY-MM-DD
     const entryMatch = line.match(/^-\s+\[(.+?)\]\((.+?)\)\s*[—–-]\s*(.+)/);
     if (entryMatch) {
+      const rawSummary = entryMatch[3].trim();
+      // Parse optional | tags: ... | updated: ... suffixes
+      let summary = rawSummary;
+      let tags: string[] = [];
+      let updated = "";
+
+      const tagsMatch = rawSummary.match(/\|\s*tags:\s*([^|]+)/);
+      if (tagsMatch) {
+        tags = tagsMatch[1].split(",").map((t) => t.trim()).filter(Boolean);
+        summary = summary.replace(tagsMatch[0], "").trim();
+      }
+      const updatedMatch = rawSummary.match(/\|\s*updated:\s*(\S+)/);
+      if (updatedMatch) {
+        updated = updatedMatch[1].trim();
+        summary = summary.replace(updatedMatch[0], "").trim();
+      }
+      // Clean trailing pipe if any
+      summary = summary.replace(/\|?\s*$/, "").trim();
+
       entries.push({
         title: entryMatch[1].trim(),
         path: entryMatch[2].trim(),
-        summary: entryMatch[3].trim(),
+        summary,
         section: currentSection,
+        tags: tags.length > 0 ? tags : undefined,
+        updated: updated || undefined,
       });
     }
   }
@@ -66,7 +90,10 @@ export function writeIndex(entries: IndexEntry[]): void {
   for (const [section, items] of sections) {
     lines.push(`## ${section}`, "");
     for (const item of items) {
-      lines.push(`- [${item.title}](${item.path}) — ${item.summary}`);
+      let line = `- [${item.title}](${item.path}) — ${item.summary}`;
+      if (item.tags?.length) line += ` | tags: ${item.tags.join(", ")}`;
+      if (item.updated) line += ` | updated: ${item.updated}`;
+      lines.push(line);
     }
     lines.push("");
   }
@@ -101,7 +128,8 @@ export function removeFromIndex(path: string): boolean {
 
 /**
  * Search the index for entries matching a query.
- * Matches against title, summary, section, and path using keyword overlap.
+ * Matches against title, summary, section, path, and tags using keyword overlap.
+ * Boosts recently updated pages as a tiebreaker.
  */
 export function searchIndex(query: string, limit = 10): IndexEntry[] {
   const entries = parseIndex();
@@ -115,8 +143,9 @@ export function searchIndex(query: string, limit = 10): IndexEntry[] {
     return entries.slice(0, limit);
   }
 
+  const now = Date.now();
   const scored = entries.map((entry) => {
-    const text = `${entry.title} ${entry.summary} ${entry.section} ${entry.path}`.toLowerCase();
+    const text = `${entry.title} ${entry.summary} ${entry.section} ${entry.path} ${(entry.tags || []).join(" ")}`.toLowerCase();
     const words = text.split(/\s+/);
     let hits = 0;
     for (const w of words) {
@@ -124,10 +153,23 @@ export function searchIndex(query: string, limit = 10): IndexEntry[] {
         if (w.includes(q)) { hits++; break; }
       }
     }
-    return { entry, hits };
+    // Tag exact match gets a bonus
+    for (const tag of entry.tags || []) {
+      for (const q of queryWords) {
+        if (tag.toLowerCase() === q) { hits += 2; }
+      }
+    }
+    // Recency boost: pages updated in the last 7 days get a small boost
+    let recencyBoost = 0;
+    if (entry.updated) {
+      const daysSince = (now - new Date(entry.updated).getTime()) / (1000 * 60 * 60 * 24);
+      if (daysSince < 7) recencyBoost = 0.5;
+      else if (daysSince < 30) recencyBoost = 0.2;
+    }
+    return { entry, score: hits + recencyBoost };
   })
-    .filter((s) => s.hits > 0)
-    .sort((a, b) => b.hits - a.hits)
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
   return scored.map((s) => s.entry);
@@ -141,7 +183,10 @@ export function getIndexSummary(): string {
   const sections = new Map<string, string[]>();
   for (const e of entries) {
     const list = sections.get(e.section) || [];
-    list.push(`${e.title}: ${e.summary}`);
+    let item = `${e.title}: ${e.summary}`;
+    if (e.tags?.length) item += ` [${e.tags.join(", ")}]`;
+    if (e.updated) item += ` (${e.updated})`;
+    list.push(item);
     sections.set(e.section, list);
   }
 
