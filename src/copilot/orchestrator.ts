@@ -164,8 +164,6 @@ async function ensureOrchestratorSession(): Promise<CopilotSession> {
 async function createOrResumeSession(): Promise<CopilotSession> {
   const client = await ensureClient();
   const { tools, mcpServers, skillDirectories } = getSessionConfig();
-  const wikiSummary = getWikiSummary();
-
   const infiniteSessions = {
     enabled: true,
     backgroundCompactionThreshold: 0.80,
@@ -182,7 +180,7 @@ async function createOrResumeSession(): Promise<CopilotSession> {
         configDir: SESSIONS_DIR,
         streaming: true,
         systemMessage: {
-          content: getOrchestratorSystemMessage(wikiSummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
+          content: getOrchestratorSystemMessage({ selfEditEnabled: config.selfEditEnabled }),
         },
         tools,
         mcpServers,
@@ -206,7 +204,7 @@ async function createOrResumeSession(): Promise<CopilotSession> {
     configDir: SESSIONS_DIR,
     streaming: true,
     systemMessage: {
-      content: getOrchestratorSystemMessage(wikiSummary || undefined, { selfEditEnabled: config.selfEditEnabled }),
+      content: getOrchestratorSystemMessage({ selfEditEnabled: config.selfEditEnabled }),
     },
     tools,
     mcpServers,
