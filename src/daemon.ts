@@ -156,14 +156,13 @@ async function shutdown(): Promise<void> {
     process.exit(1);
   }
 
-  // Check for active agents before shutting down
-  const agents = getAgentInfo();
-  const activeAgents = agents.filter(a => a.active);
+  // Check for running workers before shutting down
+  const workers = getAgentInfo();
 
-  if (activeAgents.length > 0 && shutdownState === "idle") {
-    const names = activeAgents.map(a => `@${a.slug}`).join(", ");
-    console.log(`\n[max] ⚠ ${activeAgents.length} active agent session(s) will be destroyed: ${names}`);
-    console.log("[max] Press Ctrl+C again to shut down, or wait for agents to finish.");
+  if (workers.length > 0 && shutdownState === "idle") {
+    const names = workers.map(w => `@${w.slug}`).join(", ");
+    console.log(`\n[max] ⚠ ${workers.length} running worker(s) will be stopped: ${names}`);
+    console.log("[max] Press Ctrl+C again to shut down, or wait for workers to finish.");
     shutdownState = "warned";
     return;
   }
@@ -195,10 +194,9 @@ async function shutdown(): Promise<void> {
 export async function restartDaemon(): Promise<void> {
   console.log("[max] Restarting...");
 
-  const agents = getAgentInfo();
-  const activeCount = agents.filter(a => a.active).length;
-  if (activeCount > 0) {
-    console.log(`[max] ⚠ Destroying ${activeCount} active agent session(s) for restart`);
+  const workers = getAgentInfo();
+  if (workers.length > 0) {
+    console.log(`[max] ⚠ Stopping ${workers.length} running worker(s) for restart`);
   }
 
   if (config.telegramEnabled) {

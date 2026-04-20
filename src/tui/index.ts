@@ -732,13 +732,12 @@ function sendCancel(): void {
 
 // ── Command handlers ──────────────────────────────────────
 function cmdAgents(): void {
-  apiGet("/agents", (agents: any[]) => {
-    if (!agents || agents.length === 0) {
-      console.log(C.dim("  No agents configured.\n"));
+  apiGet("/agents", (workers: any[]) => {
+    if (!workers || workers.length === 0) {
+      console.log(C.dim("  No workers running.\n"));
     } else {
-      for (const a of agents) {
-        const badge = a.active ? C.green("● active") : C.dim("○ idle");
-        console.log(`  ${badge}  ${C.bold("@" + a.slug)}  ${C.dim(a.model)}  ${C.dim(a.description || "")}`);
+      for (const w of workers) {
+        console.log(`  ${C.green("●")}  ${C.bold("@" + w.slug)}  ${C.dim(w.taskId)}  ${C.dim(w.description || "")}`);
       }
       console.log();
     }

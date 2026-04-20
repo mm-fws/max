@@ -10,8 +10,8 @@ import { getWikiSummary } from "../wiki/context.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
 import {
-  loadAgents, ensureDefaultAgents, getOrCreateAgentSession,
-  destroyAllAgentSessions, getAgentRegistry, getActiveAgent,
+  loadAgents, ensureDefaultAgents,
+  clearActiveTasks, getAgentRegistry, getActiveAgent,
   setActiveAgent, parseAtMention, buildAgentRoster,
   getActiveTasks, completeTask, failTask,
 } from "./agents.js";
@@ -356,8 +356,10 @@ async function processQueue(): Promise<void> {
       let result: string;
 
       if (item.targetAgent && item.targetAgent !== "max") {
-        // Route directly to the named agent
-        result = await executeOnAgentSession(item.targetAgent, item.prompt, item.callback);
+        // @mention switches the active agent — route through the orchestrator session
+        // The prompt already carries the @mention context for the LLM
+        setActiveAgent(item.channelKey || "default", item.targetAgent);
+        result = await executeOnSession(item.prompt, item.callback, item.attachments);
       } else {
         // Route the model before executing on orchestrator
         const routeResult = await resolveModel(item.prompt, currentSessionModel || config.copilotModel, recentTiers);
@@ -393,40 +395,6 @@ async function processQueue(): Promise<void> {
   }
 
   processing = false;
-}
-
-/** Execute a prompt on a named agent's session. */
-async function executeOnAgentSession(
-  agentSlug: string,
-  prompt: string,
-  callback: MessageCallback
-): Promise<string> {
-  if (!copilotClient) throw new Error("Copilot client not initialized");
-
-  const { tools: allTools } = getSessionConfig();
-  const session = await getOrCreateAgentSession(agentSlug, copilotClient, allTools);
-
-  let accumulated = "";
-  let toolCallExecuted = false;
-  const unsubToolDone = session.on("tool.execution_complete", () => {
-    toolCallExecuted = true;
-  });
-  const unsubDelta = session.on("assistant.message_delta", (event) => {
-    if (toolCallExecuted && accumulated.length > 0 && !accumulated.endsWith("\n")) {
-      accumulated += "\n";
-    }
-    toolCallExecuted = false;
-    accumulated += event.data.deltaContent;
-    callback(accumulated, false);
-  });
-
-  try {
-    const result = await session.sendAndWait({ prompt }, 300_000);
-    return result?.data?.content || accumulated || "(No response)";
-  } finally {
-    unsubDelta();
-    unsubToolDone();
-  }
 }
 
 function isRecoverableError(err: unknown): boolean {
@@ -536,19 +504,23 @@ export function switchSessionModel(newModel: string): Promise<void> {
   return Promise.resolve();
 }
 
-/** Return a snapshot of active agent info for API/UI consumers. */
-export function getAgentInfo(): Array<{ slug: string; name: string; model: string; description: string; active: boolean }> {
+/** Return a snapshot of currently running workers for API/UI consumers. */
+export function getAgentInfo(): Array<{ slug: string; name: string; model: string; taskId: string; description: string }> {
+  const allTasks = getActiveTasks().filter((t) => t.status === "running");
   const registry = getAgentRegistry();
-  return registry.map((a) => ({
-    slug: a.slug,
-    name: a.name,
-    model: a.model,
-    description: a.description,
-    active: !!getActiveAgent(a.slug),
-  }));
+  return allTasks.map((t) => {
+    const agent = registry.find((a) => a.slug === t.agentSlug);
+    return {
+      slug: t.agentSlug,
+      name: agent?.name || t.agentSlug,
+      model: agent?.model || "unknown",
+      taskId: t.taskId,
+      description: t.description,
+    };
+  });
 }
 
-/** Clean up all agent sessions (call on shutdown/restart). */
+/** Clean up on shutdown/restart. */
 export async function shutdownAgents(): Promise<void> {
-  await destroyAllAgentSessions();
+  await clearActiveTasks();
 }

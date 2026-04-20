@@ -14,9 +14,9 @@ import { searchIndex, addToIndex, removeFromIndex, parseIndex, buildIndexEntryFo
 import { appendLog } from "../wiki/log-manager.js";
 import { withWikiWrite } from "../wiki/lock.js";
 import {
-  getAgentRegistry, getAgent, getOrCreateAgentSession, getAgentSessionStatus,
+  getAgentRegistry, getAgent, createEphemeralAgentSession, getAgentSessionStatus,
   getActiveTasks, getTask, registerTask, completeTask, failTask,
-  createAgentFile, removeAgentFile, loadAgents, destroyAgentSession,
+  createAgentFile, removeAgentFile, loadAgents,
   type AgentConfig, type AgentTaskInfo,
 } from "./agents.js";
 
@@ -72,7 +72,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
     defineTool("delegate_to_agent", {
       description:
         "Delegate a task to a specialist agent. The task runs in the background — you'll be notified when it's done. " +
-        "Available agents: use list_agents to see the roster. For @general-purpose, specify model_override based on task complexity.",
+        "Available agents: use show_agent_roster to see the roster. For @general-purpose, specify model_override based on task complexity.",
       parameters: z.object({
         agent_name: z.string().describe("Name or slug of the agent to delegate to (e.g. 'coder', 'designer', 'general-purpose')"),
         task: z.string().describe("Detailed task description for the agent"),
@@ -92,7 +92,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         try {
           // Get all tools so we can filter for this agent
           const allTools = createTools(deps);
-          session = await getOrCreateAgentSession(agent.slug, deps.client, allTools, args.model_override);
+          session = await createEphemeralAgentSession(agent.slug, deps.client, allTools, args.model_override);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return `Failed to create session for @${agent.slug}: ${msg}`;
@@ -107,27 +107,23 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         ).run(task.taskId, agent.slug, args.task, task.originChannel || null);
 
         const timeoutMs = config.workerTimeoutMs;
-        // Non-blocking: dispatch and return immediately
-        session.sendAndWait({ prompt: args.task }, timeoutMs).then((result) => {
-          const output = result?.data?.content || "No response";
-          completeTask(task.taskId, output);
-          db.prepare(`UPDATE agent_tasks SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(output.slice(0, 10000), task.taskId);
-          deps.onAgentTaskComplete(task.taskId, agent.slug, output);
-
-          // Destroy ephemeral sessions (model: "auto" agents)
-          if (agent.model === "auto") {
+        // Non-blocking: dispatch and return immediately. Session is always destroyed after.
+        (async () => {
+          try {
+            const result = await session.sendAndWait({ prompt: args.task }, timeoutMs);
+            const output = result?.data?.content || "No response";
+            completeTask(task.taskId, output);
+            db.prepare(`UPDATE agent_tasks SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(output.slice(0, 10000), task.taskId);
+            deps.onAgentTaskComplete(task.taskId, agent.slug, output);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failTask(task.taskId, msg);
+            db.prepare(`UPDATE agent_tasks SET status = 'error', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(msg, task.taskId);
+            deps.onAgentTaskComplete(task.taskId, agent.slug, `Error: ${msg}`);
+          } finally {
             session.destroy().catch(() => {});
           }
-        }).catch((err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          failTask(task.taskId, msg);
-          db.prepare(`UPDATE agent_tasks SET status = 'error', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(msg, task.taskId);
-          deps.onAgentTaskComplete(task.taskId, agent.slug, `Error: ${msg}`);
-
-          if (agent.model === "auto") {
-            session.destroy().catch(() => {});
-          }
-        });
+        })();
 
         const model = agent.model === "auto"
           ? (args.model_override || "claude-sonnet-4.6")
@@ -156,7 +152,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
           const agent = getAgent(args.agent_name);
           if (!agent) return `Agent '${args.agent_name}' not found.`;
           const status = getAgentSessionStatus(agent.slug);
-          let info = `@${agent.slug} (${agent.name})\nModel: ${agent.model}\nSession: ${status.hasSession ? "active" : "not started"}`;
+          let info = `@${agent.slug} (${agent.name})\nModel: ${agent.model}`;
           if (status.tasks.length > 0) {
             info += `\n\nActive tasks (${status.tasks.length}):`;
             for (const t of status.tasks) {
@@ -171,7 +167,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         const lines = agents.map((a) => {
           const status = getAgentSessionStatus(a.slug);
           const runningTasks = status.tasks.filter((t) => t.status === "running");
-          const sessionBadge = status.hasSession ? "●" : "○";
+          const sessionBadge = runningTasks.length > 0 ? "●" : "○";
           const taskInfo = runningTasks.length > 0 ? ` (${runningTasks.length} task(s) running)` : "";
           return `${sessionBadge} @${a.slug} — ${a.description} [${a.model}]${taskInfo}`;
         });
@@ -201,7 +197,7 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
       },
     }),
 
-    defineTool("list_agents", {
+    defineTool("show_agent_roster", {
       description: "List all registered agents with their name, model, status, and current tasks.",
       parameters: z.object({}),
       handler: async () => {
@@ -210,10 +206,10 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
 
         const lines = agents.map((a) => {
           const status = getAgentSessionStatus(a.slug);
-          const badge = status.hasSession ? "● active" : "○ idle";
-          const tasks = status.tasks.filter((t) => t.status === "running");
-          const taskInfo = tasks.length > 0
-            ? `\n    Tasks: ${tasks.map((t) => `${t.taskId}: ${t.description}`).join(", ")}`
+          const runningTasks = status.tasks.filter((t) => t.status === "running");
+          const badge = runningTasks.length > 0 ? "● working" : "○ idle";
+          const taskInfo = runningTasks.length > 0
+            ? `\n    Tasks: ${runningTasks.map((t) => `${t.taskId}: ${t.description}`).join(", ")}`
             : "";
           return `• @${a.slug} (${a.name}) — ${a.model} — ${badge}${taskInfo}\n  ${a.description}`;
         });
@@ -254,7 +250,6 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
       handler: async (args) => {
         const err = removeAgentFile(args.slug);
         if (err) return err;
-        await destroyAgentSession(args.slug);
         loadAgents();
         return `Agent @${args.slug} removed.`;
       },

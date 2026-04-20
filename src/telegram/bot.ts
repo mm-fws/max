@@ -187,13 +187,12 @@ export function createBot(): Bot {
     }
   });
   const agentCommandHandler = async (ctx: Context) => {
-    const agents = getAgentInfo();
-    if (agents.length === 0) {
-      await ctx.reply("No agents configured.");
+    const workers = getAgentInfo();
+    if (workers.length === 0) {
+      await ctx.reply("No workers running.");
     } else {
-      const lines = agents.map((a) => {
-        const status = a.active ? "🟢 active" : "⚪ idle";
-        return `• @${a.slug} (${a.model}) — ${status}`;
+      const lines = workers.map((w) => {
+        return `🟢 @${w.slug} — ${w.taskId}: ${w.description}`;
       });
       await ctx.reply(lines.join("\n"));
     }

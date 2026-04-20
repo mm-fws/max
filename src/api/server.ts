@@ -47,12 +47,13 @@ let connectionCounter = 0;
 
 // Health check — intentionally unauthenticated, returns no sensitive data
 app.get("/status", (_req: Request, res: Response) => {
+  const workers = getAgentInfo();
   res.json({
     status: "ok",
-    agents: getAgentInfo().map((a) => ({
-      slug: a.slug,
-      name: a.name,
-      active: a.active,
+    workers: workers.map((w) => ({
+      slug: w.slug,
+      taskId: w.taskId,
+      description: w.description,
     })),
   });
 });

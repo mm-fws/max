@@ -83,7 +83,7 @@ You can delegate **multiple tasks simultaneously**. Different agents can work in
 - \`delegate_to_agent\`: Send a task to a specialist agent. Runs in the background — you'll get results via a completion message.
 - \`check_agent_status\`: Check on an agent or specific task. Use when the user asks about status.
 - \`get_agent_result\`: Retrieve the result of a completed task.
-- \`list_agents\`: Show all registered agents with their model, status, and current tasks.
+- \`show_agent_roster\`: Show all registered agents with their model, status, and current tasks.
 - \`hire_agent\`: Create a new custom agent by writing an .agent.md file.
 - \`fire_agent\`: Remove a custom agent (cannot remove built-in agents).
 

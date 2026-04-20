@@ -239,8 +239,6 @@ export function removeAgentFile(slug: string): string | null {
 // Agent Session Management
 // ---------------------------------------------------------------------------
 
-const agentSessions = new Map<string, CopilotSession>();
-
 // Per-agent task tracking (in-memory, backed by DB)
 const activeTasks = new Map<string, AgentTaskInfo>();
 let taskCounter = 0;
@@ -271,7 +269,7 @@ All agents share a wiki knowledge base for persistent memory. Use \`wiki_read\` 
 }
 
 /** Build the full system message for an agent. */
-function composeAgentSystemMessage(agent: AgentConfig, rosterInfo?: string): string {
+export function composeAgentSystemMessage(agent: AgentConfig, rosterInfo?: string): string {
   const base = getAgentBasePrompt();
   const agentPrompt = agent.systemMessage;
 
@@ -307,7 +305,7 @@ const WIKI_TOOL_NAMES = new Set([
 // Management tools that only @max should have
 const MANAGEMENT_TOOL_NAMES = new Set([
   "delegate_to_agent", "check_agent_status", "get_agent_result",
-  "list_agents", "hire_agent", "fire_agent",
+  "show_agent_roster", "hire_agent", "fire_agent",
   "switch_model", "toggle_auto", "list_models",
   "restart_max", "list_skills", "learn_skill", "uninstall_skill",
   "list_machine_sessions", "attach_machine_session",
@@ -330,8 +328,8 @@ export function filterToolsForAgent(agent: AgentConfig, allTools: Tool<any>[]): 
   return allTools.filter((t) => !MANAGEMENT_TOOL_NAMES.has(t.name));
 }
 
-/** Create or return existing session for an agent. */
-export async function getOrCreateAgentSession(
+/** Create an ephemeral session for an agent. Always creates a fresh session — caller is responsible for destroying it. */
+export async function createEphemeralAgentSession(
   slug: string,
   client: CopilotClient,
   allTools: Tool<any>[],
@@ -340,62 +338,23 @@ export async function getOrCreateAgentSession(
   const agent = getAgent(slug);
   if (!agent) throw new Error(`Agent '${slug}' not found in registry.`);
 
-  // For "auto" model agents, always create ephemeral sessions with the specified model
-  if (agent.model === "auto") {
-    const model = modelOverride || "claude-sonnet-4.6";
-    const tools = filterToolsForAgent(agent, allTools);
-    const mcpServers = loadMcpConfig();
-    const skillDirectories = getSkillDirectories();
-    // Filter skill directories based on agent config
-    const filteredSkills = agent.skills?.length
-      ? skillDirectories // SDK handles skill name matching
-      : skillDirectories;
-
-    const session = await client.createSession({
-      model,
-      configDir: SESSIONS_DIR,
-      workingDirectory: process.cwd(),
-      streaming: true,
-      systemMessage: { content: composeAgentSystemMessage(agent) },
-      tools,
-      mcpServers,
-      skillDirectories: filteredSkills,
-      onPermissionRequest: approveAll,
-      infiniteSessions: {
-        enabled: true,
-        backgroundCompactionThreshold: 0.80,
-        bufferExhaustionThreshold: 0.95,
-      },
-    });
-    return session;
-  }
-
-  // Persistent agents: return existing session or create new one
-  const existing = agentSessions.get(slug);
-  if (existing) return existing;
-
+  const model = agent.model === "auto"
+    ? (modelOverride || "claude-sonnet-4.6")
+    : agent.model;
   const tools = filterToolsForAgent(agent, allTools);
   const mcpServers = loadMcpConfig();
   const skillDirectories = getSkillDirectories();
-  const rosterInfo = slug === "max" ? buildAgentRoster() : undefined;
 
   const session = await client.createSession({
-    model: agent.model,
+    model,
     configDir: SESSIONS_DIR,
     workingDirectory: process.cwd(),
     streaming: true,
-    systemMessage: { content: composeAgentSystemMessage(agent, rosterInfo) },
+    systemMessage: { content: composeAgentSystemMessage(agent) },
     tools,
     mcpServers,
     skillDirectories,
-    onPermissionRequest: slug === "max"
-      ? (request: { kind: string }) => {
-          if (request.kind === "custom-tool" || request.kind === "mcp") {
-            return { kind: "approved" as const };
-          }
-          return { kind: "denied-by-rules" as const, rules: [] as unknown[] };
-        }
-      : approveAll,
+    onPermissionRequest: approveAll,
     infiniteSessions: {
       enabled: true,
       backgroundCompactionThreshold: 0.80,
@@ -403,38 +362,22 @@ export async function getOrCreateAgentSession(
     },
   });
 
-  agentSessions.set(slug, session);
-  console.log(`[agents] Created session for @${agent.name} (${agent.model})`);
+  console.log(`[agents] Created ephemeral session for @${agent.slug} (${model})`);
   return session;
 }
 
-/** Destroy a specific agent session. */
-export async function destroyAgentSession(slug: string): Promise<void> {
-  const session = agentSessions.get(slug);
-  if (session) {
-    try { await session.destroy(); } catch { /* best-effort */ }
-    agentSessions.delete(slug);
-  }
-}
-
-/** Destroy all agent sessions (for shutdown/restart). */
-export async function destroyAllAgentSessions(): Promise<void> {
-  await Promise.allSettled(
-    Array.from(agentSessions.values()).map((s) => s.destroy())
-  );
-  agentSessions.clear();
+/** Clean up active task tracking (for shutdown/restart). */
+export async function clearActiveTasks(): Promise<void> {
   activeTasks.clear();
 }
 
-/** Get status info for an agent. */
+/** Get status info for an agent (task info only — no persistent sessions). */
 export function getAgentSessionStatus(slug: string): {
-  hasSession: boolean;
   taskCount: number;
   tasks: AgentTaskInfo[];
 } {
   const tasks = Array.from(activeTasks.values()).filter((t) => t.agentSlug === slug);
   return {
-    hasSession: agentSessions.has(slug),
     taskCount: tasks.length,
     tasks,
   };
