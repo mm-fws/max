@@ -2,7 +2,7 @@ import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { randomBytes } from "crypto";
-import { sendToOrchestrator, getWorkers, cancelCurrentMessage, getLastRouteResult } from "../copilot/orchestrator.js";
+import { sendToOrchestrator, getAgentInfo, cancelCurrentMessage, getLastRouteResult } from "../copilot/orchestrator.js";
 import { sendPhoto } from "../telegram/bot.js";
 import { config, persistModel } from "../config.js";
 import { getRouterConfig, updateRouterConfig } from "../copilot/router.js";
@@ -49,22 +49,22 @@ let connectionCounter = 0;
 app.get("/status", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
-    workers: Array.from(getWorkers().values()).map((w) => ({
-      name: w.name,
-      status: w.status,
+    agents: getAgentInfo().map((a) => ({
+      slug: a.slug,
+      name: a.name,
+      active: a.active,
     })),
   });
 });
 
-// List worker sessions
+// List agents
+app.get("/agents", (_req: Request, res: Response) => {
+  res.json(getAgentInfo());
+});
+
+// Keep /sessions as an alias for backwards compat
 app.get("/sessions", (_req: Request, res: Response) => {
-  const workers = Array.from(getWorkers().values()).map((w) => ({
-    name: w.name,
-    workingDir: w.workingDir,
-    status: w.status,
-    lastOutput: w.lastOutput?.slice(0, 500),
-  }));
-  res.json(workers);
+  res.json(getAgentInfo());
 });
 
 // SSE stream for real-time responses

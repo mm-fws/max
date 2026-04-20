@@ -1,5 +1,5 @@
 import { getClient, stopClient } from "./copilot/client.js";
-import { initOrchestrator, setMessageLogger, setProactiveNotify, getWorkers } from "./copilot/orchestrator.js";
+import { initOrchestrator, setMessageLogger, setProactiveNotify, getAgentInfo, shutdownAgents } from "./copilot/orchestrator.js";
 import { startApiServer, broadcastToSSE } from "./api/server.js";
 import { createBot, startBot, stopBot, sendProactiveMessage } from "./telegram/bot.js";
 import { getDb, closeDb, getState } from "./store/db.js";
@@ -156,14 +156,14 @@ async function shutdown(): Promise<void> {
     process.exit(1);
   }
 
-  // Check for active workers before shutting down
-  const workers = getWorkers();
-  const running = Array.from(workers.values()).filter(w => w.status === "running");
+  // Check for active agents before shutting down
+  const agents = getAgentInfo();
+  const activeAgents = agents.filter(a => a.active);
 
-  if (running.length > 0 && shutdownState === "idle") {
-    const names = running.map(w => w.name).join(", ");
-    console.log(`\n[max] ⚠ ${running.length} active worker(s) will be destroyed: ${names}`);
-    console.log("[max] Press Ctrl+C again to shut down, or wait for workers to finish.");
+  if (activeAgents.length > 0 && shutdownState === "idle") {
+    const names = activeAgents.map(a => `@${a.slug}`).join(", ");
+    console.log(`\n[max] ⚠ ${activeAgents.length} active agent session(s) will be destroyed: ${names}`);
+    console.log("[max] Press Ctrl+C again to shut down, or wait for agents to finish.");
     shutdownState = "warned";
     return;
   }
@@ -182,11 +182,8 @@ async function shutdown(): Promise<void> {
     try { await stopBot(); } catch { /* best effort */ }
   }
 
-  // Destroy all active worker sessions to free memory
-  await Promise.allSettled(
-    Array.from(workers.values()).map((w) => w.session.destroy())
-  );
-  workers.clear();
+  // Destroy all active agent sessions
+  await shutdownAgents();
 
   try { await stopClient(); } catch { /* best effort */ }
   closeDb();
@@ -198,10 +195,10 @@ async function shutdown(): Promise<void> {
 export async function restartDaemon(): Promise<void> {
   console.log("[max] Restarting...");
 
-  const activeWorkers = getWorkers();
-  const runningCount = Array.from(activeWorkers.values()).filter(w => w.status === "running").length;
-  if (runningCount > 0) {
-    console.log(`[max] ⚠ Destroying ${runningCount} active worker(s) for restart`);
+  const agents = getAgentInfo();
+  const activeCount = agents.filter(a => a.active).length;
+  if (activeCount > 0) {
+    console.log(`[max] ⚠ Destroying ${activeCount} active agent session(s) for restart`);
   }
 
   if (config.telegramEnabled) {
@@ -209,11 +206,8 @@ export async function restartDaemon(): Promise<void> {
     try { await stopBot(); } catch { /* best effort */ }
   }
 
-  // Destroy all active worker sessions to free memory
-  await Promise.allSettled(
-    Array.from(activeWorkers.values()).map((w) => w.session.destroy())
-  );
-  activeWorkers.clear();
+  // Destroy all active agent sessions
+  await shutdownAgents();
 
   try { await stopClient(); } catch { /* best effort */ }
   closeDb();

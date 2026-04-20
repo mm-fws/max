@@ -1,6 +1,6 @@
 import { Bot, type Context } from "grammy";
 import { config, persistModel } from "../config.js";
-import { sendToOrchestrator, cancelCurrentMessage, getWorkers, getLastRouteResult } from "../copilot/orchestrator.js";
+import { sendToOrchestrator, cancelCurrentMessage, getAgentInfo, getLastRouteResult } from "../copilot/orchestrator.js";
 import { chunkMessage, toTelegramMarkdown } from "./formatter.js";
 import { parseIndex } from "../wiki/index-manager.js";
 import { ensureWikiStructure } from "../wiki/fs.js";
@@ -107,7 +107,8 @@ export function createBot(): Bot {
         "/auto — Toggle auto model routing\n" +
         "/memory — Show stored memories\n" +
         "/skills — List installed skills\n" +
-        "/workers — List active worker sessions\n" +
+        "/agents — List available agents\n" +
+        "/workers — Alias for /agents\n" +
         "/restart — Restart Max\n" +
         "/help — Show this help"
     )
@@ -185,15 +186,20 @@ export function createBot(): Bot {
       await ctx.reply(lines.join("\n"));
     }
   });
-  bot.command("workers", async (ctx) => {
-    const workers = Array.from(getWorkers().values());
-    if (workers.length === 0) {
-      await ctx.reply("No active worker sessions.");
+  const agentCommandHandler = async (ctx: Context) => {
+    const agents = getAgentInfo();
+    if (agents.length === 0) {
+      await ctx.reply("No agents configured.");
     } else {
-      const lines = workers.map((w) => `• ${w.name} (${w.workingDir}) — ${w.status}`);
+      const lines = agents.map((a) => {
+        const status = a.active ? "🟢 active" : "⚪ idle";
+        return `• @${a.slug} (${a.model}) — ${status}`;
+      });
       await ctx.reply(lines.join("\n"));
     }
-  });
+  };
+  bot.command("agents", agentCommandHandler);
+  bot.command("workers", agentCommandHandler);
   bot.command("restart", async (ctx) => {
     await ctx.reply("⏳ Restarting Max...");
     setTimeout(() => {

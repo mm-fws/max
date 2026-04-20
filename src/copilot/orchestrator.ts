@@ -1,5 +1,5 @@
 import { type CopilotClient, type CopilotSession } from "@github/copilot-sdk";
-import { createTools, type WorkerInfo } from "./tools.js";
+import { createTools, type ToolDeps } from "./tools.js";
 import { getOrchestratorSystemMessage } from "./system-message.js";
 import { config, DEFAULT_MODEL } from "../config.js";
 import { loadMcpConfig } from "./mcp-config.js";
@@ -9,6 +9,12 @@ import { logConversation, getState, setState, deleteState } from "../store/db.js
 import { getWikiSummary } from "../wiki/context.js";
 import { SESSIONS_DIR } from "../paths.js";
 import { resolveModel, type Tier, type RouteResult } from "./router.js";
+import {
+  loadAgents, ensureDefaultAgents, getOrCreateAgentSession,
+  destroyAllAgentSessions, getAgentRegistry, getActiveAgent,
+  setActiveAgent, parseAtMention, buildAgentRoster,
+  getActiveTasks, completeTask, failTask,
+} from "./agents.js";
 
 
 /**
@@ -21,7 +27,7 @@ const orchestratorPermissionHandler = (request: { kind: string }) => {
   if (request.kind === "custom-tool" || request.kind === "mcp") {
     return { kind: "approved" as const };
   }
-  return { kind: "denied-by-rules" as const };
+  return { kind: "denied-by-rules" as const, rules: [] as unknown[] };
 };
 
 const MAX_RETRIES = 3;
@@ -53,7 +59,6 @@ export function setProactiveNotify(fn: ProactiveNotifyFn): void {
 }
 
 let copilotClient: CopilotClient | undefined;
-const workers = new Map<string, WorkerInfo>();
 let healthCheckTimer: ReturnType<typeof setInterval> | undefined;
 
 // Router state — tracks model across the session
@@ -76,6 +81,10 @@ type QueuedMessage = {
   attachments?: Array<{ type: "file"; path: string; displayName?: string }>;
   callback: MessageCallback;
   sourceChannel?: "telegram" | "tui";
+  /** Target agent slug for @mention routing. If undefined, goes to orchestrator. */
+  targetAgent?: string;
+  /** Conversation channel key for sticky routing, e.g. "telegram:123" or "tui:conn-1". */
+  channelKey?: string;
   resolve: (value: string) => void;
   reject: (err: unknown) => void;
 };
@@ -93,24 +102,25 @@ export function getCurrentSourceChannel(): "telegram" | "tui" | undefined {
 function getSessionConfig() {
   const tools = createTools({
     client: copilotClient!,
-    workers,
-    onWorkerComplete: feedBackgroundResult,
+    onAgentTaskComplete: feedAgentResult,
   });
   const mcpServers = loadMcpConfig();
   const skillDirectories = getSkillDirectories();
   return { tools, mcpServers, skillDirectories };
 }
 
-/** Feed a background worker result into the orchestrator as a new turn. */
-export function feedBackgroundResult(workerName: string, result: string): void {
-  const worker = workers.get(workerName);
-  const channel = worker?.originChannel;
-  const prompt = `[Background task completed] Worker '${workerName}' finished:\n\n${result}`;
+/** Feed an agent task result into the orchestrator as a new turn. */
+export function feedAgentResult(taskId: string, agentSlug: string, result: string): void {
+  const prompt = `[Agent task completed] @${agentSlug} finished task ${taskId}:\n\n${result}`;
   sendToOrchestrator(
     prompt,
     { type: "background" },
     (_text, done) => {
       if (done && proactiveNotifyFn) {
+        // Route notification to the task's origin channel
+        const tasks = getActiveTasks();
+        const task = tasks.find((t) => t.taskId === taskId);
+        const channel = task?.originChannel as "telegram" | "tui" | undefined;
         proactiveNotifyFn(_text, channel);
       }
     }
@@ -196,7 +206,11 @@ async function createOrResumeSession(): Promise<CopilotSession> {
         configDir: SESSIONS_DIR,
         streaming: true,
         systemMessage: {
-          content: getOrchestratorSystemMessage({ selfEditEnabled: config.selfEditEnabled, memorySummary: memorySummary || undefined }),
+          content: getOrchestratorSystemMessage({
+            selfEditEnabled: config.selfEditEnabled,
+            memorySummary: memorySummary || undefined,
+            agentRoster: buildAgentRoster(),
+          }),
         },
         tools,
         mcpServers,
@@ -223,6 +237,7 @@ async function createOrResumeSession(): Promise<CopilotSession> {
       content: getOrchestratorSystemMessage({
         selfEditEnabled: config.selfEditEnabled,
         memorySummary: memorySummary || undefined,
+        agentRoster: buildAgentRoster(),
       }),
     },
     tools,
@@ -243,6 +258,11 @@ async function createOrResumeSession(): Promise<CopilotSession> {
 export async function initOrchestrator(client: CopilotClient): Promise<void> {
   copilotClient = client;
   const { mcpServers, skillDirectories } = getSessionConfig();
+
+  // Initialize agent system
+  ensureDefaultAgents();
+  const agents = loadAgents();
+  console.log(`[max] Loaded ${agents.length} agent(s): ${agents.map((a) => `@${a.slug}`).join(", ") || "(none)"}`);
 
   // Validate configured model against available models
   try {
@@ -333,31 +353,38 @@ async function processQueue(): Promise<void> {
     const item = messageQueue.shift()!;
     currentSourceChannel = item.sourceChannel;
     try {
-      // Route the model before executing
-      const routeResult = resolveModel(item.prompt, currentSessionModel || config.copilotModel, recentTiers);
-      if (routeResult.switched) {
-        console.log(`[max] Auto: switching to ${routeResult.model} (${routeResult.overrideName || routeResult.tier})`);
-        config.copilotModel = routeResult.model;
-        // Use setModel() to switch in-place, preserving conversation history
-        if (orchestratorSession) {
-          try {
-            await orchestratorSession.setModel(routeResult.model);
-            currentSessionModel = routeResult.model;
-            console.log(`[max] Model switched in-place via setModel()`);
-          } catch (err) {
-            console.log(`[max] setModel() failed, will recreate session: ${err instanceof Error ? err.message : err}`);
-            orchestratorSession = undefined;
-            deleteState(ORCHESTRATOR_SESSION_KEY);
+      let result: string;
+
+      if (item.targetAgent && item.targetAgent !== "max") {
+        // Route directly to the named agent
+        result = await executeOnAgentSession(item.targetAgent, item.prompt, item.callback);
+      } else {
+        // Route the model before executing on orchestrator
+        const routeResult = await resolveModel(item.prompt, currentSessionModel || config.copilotModel, recentTiers);
+        if (routeResult.switched) {
+          console.log(`[max] Auto: switching to ${routeResult.model} (${routeResult.overrideName || routeResult.tier})`);
+          config.copilotModel = routeResult.model;
+          if (orchestratorSession) {
+            try {
+              await orchestratorSession.setModel(routeResult.model);
+              currentSessionModel = routeResult.model;
+              console.log(`[max] Model switched in-place via setModel()`);
+            } catch (err) {
+              console.log(`[max] setModel() failed, will recreate session: ${err instanceof Error ? err.message : err}`);
+              orchestratorSession = undefined;
+              deleteState(ORCHESTRATOR_SESSION_KEY);
+            }
           }
         }
-      }
-      if (routeResult.tier) {
-        recentTiers.push(routeResult.tier);
-        if (recentTiers.length > 5) recentTiers = recentTiers.slice(-5);
-      }
-      lastRouteResult = routeResult;
+        if (routeResult.tier) {
+          recentTiers.push(routeResult.tier);
+          if (recentTiers.length > 5) recentTiers = recentTiers.slice(-5);
+        }
+        lastRouteResult = routeResult;
 
-      const result = await executeOnSession(item.prompt, item.callback, item.attachments);
+        result = await executeOnSession(item.prompt, item.callback, item.attachments);
+      }
+
       item.resolve(result);
     } catch (err) {
       item.reject(err);
@@ -366,6 +393,40 @@ async function processQueue(): Promise<void> {
   }
 
   processing = false;
+}
+
+/** Execute a prompt on a named agent's session. */
+async function executeOnAgentSession(
+  agentSlug: string,
+  prompt: string,
+  callback: MessageCallback
+): Promise<string> {
+  if (!copilotClient) throw new Error("Copilot client not initialized");
+
+  const { tools: allTools } = getSessionConfig();
+  const session = await getOrCreateAgentSession(agentSlug, copilotClient, allTools);
+
+  let accumulated = "";
+  let toolCallExecuted = false;
+  const unsubToolDone = session.on("tool.execution_complete", () => {
+    toolCallExecuted = true;
+  });
+  const unsubDelta = session.on("assistant.message_delta", (event) => {
+    if (toolCallExecuted && accumulated.length > 0 && !accumulated.endsWith("\n")) {
+      accumulated += "\n";
+    }
+    toolCallExecuted = false;
+    accumulated += event.data.deltaContent;
+    callback(accumulated, false);
+  });
+
+  try {
+    const result = await session.sendAndWait({ prompt }, 300_000);
+    return result?.data?.content || accumulated || "(No response)";
+  } finally {
+    unsubDelta();
+    unsubToolDone();
+  }
 }
 
 function isRecoverableError(err: unknown): boolean {
@@ -384,15 +445,20 @@ export async function sendToOrchestrator(
     source.type === "tui" ? "tui" : "background";
   logMessage("in", sourceLabel, prompt);
 
+  // Parse @mention routing (e.g., "@coder fix the bug" → target "coder")
+  const mention = parseAtMention(prompt);
+  const targetAgent = mention?.agentSlug;
+  const routedPrompt = mention ? mention.message : prompt;
+
   // Tag the prompt with its source channel
   const taggedPrompt = source.type === "background"
-    ? prompt
-    : `[via ${sourceLabel}] ${prompt}`;
+    ? routedPrompt
+    : `[via ${sourceLabel}] ${routedPrompt}`;
 
   // Log role: background events are "system", user messages are "user"
   const logRole = source.type === "background" ? "system" : "user";
 
-  // Determine the source channel for worker origin tracking
+  // Determine the source channel for agent origin tracking
   const sourceChannel: "telegram" | "tui" | undefined =
     source.type === "telegram" ? "telegram" :
     source.type === "tui" ? "tui" : undefined;
@@ -402,7 +468,7 @@ export async function sendToOrchestrator(
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         const finalContent = await new Promise<string>((resolve, reject) => {
-          messageQueue.push({ prompt: taggedPrompt, attachments, callback, sourceChannel, resolve, reject });
+          messageQueue.push({ prompt: taggedPrompt, attachments, callback, sourceChannel, targetAgent, resolve, reject });
           processQueue();
         });
         // Deliver response to user FIRST, then log best-effort
@@ -461,13 +527,28 @@ export async function cancelCurrentMessage(): Promise<boolean> {
 }
 
 /** Switch the model on the live orchestrator session without destroying it. */
-export async function switchSessionModel(newModel: string): Promise<void> {
+export function switchSessionModel(newModel: string): Promise<void> {
   if (orchestratorSession) {
-    await orchestratorSession.setModel(newModel);
-    currentSessionModel = newModel;
+    return orchestratorSession.setModel(newModel).then(() => {
+      currentSessionModel = newModel;
+    });
   }
+  return Promise.resolve();
 }
 
-export function getWorkers(): Map<string, WorkerInfo> {
-  return workers;
+/** Return a snapshot of active agent info for API/UI consumers. */
+export function getAgentInfo(): Array<{ slug: string; name: string; model: string; description: string; active: boolean }> {
+  const registry = getAgentRegistry();
+  return registry.map((a) => ({
+    slug: a.slug,
+    name: a.name,
+    model: a.model,
+    description: a.description,
+    active: !!getActiveAgent(a.slug),
+  }));
+}
+
+/** Clean up all agent sessions (call on shutdown/restart). */
+export async function shutdownAgents(): Promise<void> {
+  await destroyAllAgentSessions();
 }

@@ -13,6 +13,12 @@ import { ensureWikiStructure, readPage, writePage, deletePage, listPages, writeR
 import { searchIndex, addToIndex, removeFromIndex, parseIndex, buildIndexEntryForPage, type IndexEntry } from "../wiki/index-manager.js";
 import { appendLog } from "../wiki/log-manager.js";
 import { withWikiWrite } from "../wiki/lock.js";
+import {
+  getAgentRegistry, getAgent, getOrCreateAgentSession, getAgentSessionStatus,
+  getActiveTasks, getTask, registerTask, completeTask, failTask,
+  createAgentFile, removeAgentFile, loadAgents, destroyAgentSession,
+  type AgentConfig, type AgentTaskInfo,
+} from "./agents.js";
 
 function getCategoryDir(category: string): string {
   const map: Record<string, string> = {
@@ -54,224 +60,203 @@ function isTimeoutError(err: unknown): boolean {
   return /timeout|timed?\s*out/i.test(msg);
 }
 
-function formatWorkerError(workerName: string, startedAt: number, timeoutMs: number, err: unknown): string {
-  const elapsed = Math.round((Date.now() - startedAt) / 1000);
-  const limit = Math.round(timeoutMs / 1000);
-  const msg = err instanceof Error ? err.message : String(err);
-
-  if (isTimeoutError(err)) {
-    return `Worker '${workerName}' timed out after ${elapsed}s (limit: ${limit}s). The task was still running but had to be stopped. To allow more time, set WORKER_TIMEOUT=${timeoutMs * 2} in ~/.max/.env`;
-  }
-  return `Worker '${workerName}' failed after ${elapsed}s: ${msg}`;
-}
-
-const BLOCKED_WORKER_DIRS = [
-  ".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud",
-  ".kube", ".docker", ".npmrc", ".pypirc",
-];
-
-const MAX_CONCURRENT_WORKERS = 5;
-
-export interface WorkerInfo {
-  name: string;
-  session: CopilotSession;
-  workingDir: string;
-  status: "idle" | "running" | "error";
-  lastOutput?: string;
-  /** Timestamp (ms) when the worker started its current task. */
-  startedAt?: number;
-  /** Channel that created this worker — completions route back here. */
-  originChannel?: "telegram" | "tui";
-}
-
 export interface ToolDeps {
   client: CopilotClient;
-  workers: Map<string, WorkerInfo>;
-  onWorkerComplete: (name: string, result: string) => void;
+  onAgentTaskComplete: (taskId: string, agentSlug: string, result: string) => void;
 }
 
 export function createTools(deps: ToolDeps): Tool<any>[] {
   return [
-    defineTool("create_worker_session", {
+    // ----- Agent Delegation Tools (for @max) -----
+
+    defineTool("delegate_to_agent", {
       description:
-        "Create a new Copilot CLI worker session in a specific directory. " +
-        "Use for coding tasks, debugging, file operations. " +
-        "Returns confirmation with session name.",
+        "Delegate a task to a specialist agent. The task runs in the background — you'll be notified when it's done. " +
+        "Available agents: use list_agents to see the roster. For @general-purpose, specify model_override based on task complexity.",
       parameters: z.object({
-        name: z.string().describe("Short descriptive name for the session, e.g. 'auth-fix'"),
-        working_dir: z.string().describe("Absolute path to the directory to work in"),
-        initial_prompt: z.string().optional().describe("Optional initial prompt to send to the worker"),
+        agent_name: z.string().describe("Name or slug of the agent to delegate to (e.g. 'coder', 'designer', 'general-purpose')"),
+        task: z.string().describe("Detailed task description for the agent"),
+        model_override: z.string().optional().describe("Model override for agents with model 'auto' (e.g. 'gpt-4.1', 'claude-sonnet-4.6', 'claude-opus-4.6')"),
       }),
       handler: async (args) => {
-        if (deps.workers.has(args.name)) {
-          return `Worker '${args.name}' already exists. Use send_to_worker to interact with it.`;
+        const agent = getAgent(args.agent_name);
+        if (!agent) {
+          const available = getAgentRegistry().map((a) => a.slug).join(", ");
+          return `Agent '${args.agent_name}' not found. Available agents: ${available}`;
+        }
+        if (agent.slug === "max") {
+          return "Cannot delegate to yourself. Handle this directly or pick a specialist agent.";
         }
 
-        const home = homedir();
-        const resolvedDir = resolve(args.working_dir);
-        for (const blocked of BLOCKED_WORKER_DIRS) {
-          const blockedPath = join(home, blocked);
-          if (resolvedDir === blockedPath || resolvedDir.startsWith(blockedPath + sep)) {
-            return `Refused: '${args.working_dir}' is a sensitive directory. Workers cannot operate in ${blocked}.`;
-          }
+        let session: CopilotSession;
+        try {
+          // Get all tools so we can filter for this agent
+          const allTools = createTools(deps);
+          session = await getOrCreateAgentSession(agent.slug, deps.client, allTools, args.model_override);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return `Failed to create session for @${agent.slug}: ${msg}`;
         }
 
-        if (deps.workers.size >= MAX_CONCURRENT_WORKERS) {
-          const names = Array.from(deps.workers.keys()).join(", ");
-          return `Worker limit reached (${MAX_CONCURRENT_WORKERS}). Active: ${names}. Kill a session first.`;
-        }
+        const task = registerTask(agent.slug, args.task, getCurrentSourceChannel());
 
-        const session = await deps.client.createSession({
-          model: config.copilotModel,
-          configDir: SESSIONS_DIR,
-          workingDirectory: args.working_dir,
-          onPermissionRequest: approveAll,
-        });
-
-        const worker: WorkerInfo = {
-          name: args.name,
-          session,
-          workingDir: args.working_dir,
-          status: "idle",
-          originChannel: getCurrentSourceChannel(),
-        };
-        deps.workers.set(args.name, worker);
-
-        // Persist to SQLite
+        // Persist task to DB
         const db = getDb();
         db.prepare(
-          `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-           VALUES (?, ?, ?, 'idle')`
-        ).run(args.name, session.sessionId, args.working_dir);
-
-        if (args.initial_prompt) {
-          worker.status = "running";
-          worker.startedAt = Date.now();
-          db.prepare(
-            `UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`
-          ).run(args.name);
-
-          const timeoutMs = config.workerTimeoutMs;
-          // Non-blocking: dispatch work and return immediately
-          session.sendAndWait({
-            prompt: `Working directory: ${args.working_dir}\n\n${args.initial_prompt}`,
-          }, timeoutMs).then((result) => {
-            worker.lastOutput = result?.data?.content || "No response";
-            deps.onWorkerComplete(args.name, worker.lastOutput);
-          }).catch((err) => {
-            const errMsg = formatWorkerError(args.name, worker.startedAt!, timeoutMs, err);
-            worker.lastOutput = errMsg;
-            deps.onWorkerComplete(args.name, errMsg);
-          }).finally(() => {
-            // Auto-destroy background workers after completion to free memory (~400MB per worker)
-            session.destroy().catch(() => {});
-            deps.workers.delete(args.name);
-            getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
-          });
-
-          return `Worker '${args.name}' created in ${args.working_dir}. Task dispatched — I'll notify you when it's done.`;
-        }
-
-        return `Worker '${args.name}' created in ${args.working_dir}. Use send_to_worker to send it prompts.`;
-      },
-    }),
-
-    defineTool("send_to_worker", {
-      description:
-        "Send a prompt to an existing worker session and wait for its response. " +
-        "Use for follow-up instructions or questions about ongoing work.",
-      parameters: z.object({
-        name: z.string().describe("Name of the worker session"),
-        prompt: z.string().describe("The prompt to send"),
-      }),
-      handler: async (args) => {
-        const worker = deps.workers.get(args.name);
-        if (!worker) {
-          return `No worker named '${args.name}'. Use list_sessions to see available workers.`;
-        }
-        if (worker.status === "running") {
-          return `Worker '${args.name}' is currently busy. Wait for it to finish or kill it.`;
-        }
-
-        worker.status = "running";
-        worker.startedAt = Date.now();
-        const db = getDb();
-        db.prepare(`UPDATE worker_sessions SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE name = ?`).run(
-          args.name
-        );
+          `INSERT INTO agent_tasks (task_id, agent_slug, description, status, origin_channel) VALUES (?, ?, ?, 'running', ?)`
+        ).run(task.taskId, agent.slug, args.task, task.originChannel || null);
 
         const timeoutMs = config.workerTimeoutMs;
-        // Non-blocking: dispatch work and return immediately
-        worker.session.sendAndWait({ prompt: args.prompt }, timeoutMs).then((result) => {
-          worker.lastOutput = result?.data?.content || "No response";
-          deps.onWorkerComplete(args.name, worker.lastOutput);
+        // Non-blocking: dispatch and return immediately
+        session.sendAndWait({ prompt: args.task }, timeoutMs).then((result) => {
+          const output = result?.data?.content || "No response";
+          completeTask(task.taskId, output);
+          db.prepare(`UPDATE agent_tasks SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(output.slice(0, 10000), task.taskId);
+          deps.onAgentTaskComplete(task.taskId, agent.slug, output);
+
+          // Destroy ephemeral sessions (model: "auto" agents)
+          if (agent.model === "auto") {
+            session.destroy().catch(() => {});
+          }
         }).catch((err) => {
-          const errMsg = formatWorkerError(args.name, worker.startedAt!, timeoutMs, err);
-          worker.lastOutput = errMsg;
-          deps.onWorkerComplete(args.name, errMsg);
-        }).finally(() => {
-          // Auto-destroy after each send_to_worker dispatch to free memory
-          worker.session.destroy().catch(() => {});
-          deps.workers.delete(args.name);
-          getDb().prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
+          const msg = err instanceof Error ? err.message : String(err);
+          failTask(task.taskId, msg);
+          db.prepare(`UPDATE agent_tasks SET status = 'error', result = ?, completed_at = CURRENT_TIMESTAMP WHERE task_id = ?`).run(msg, task.taskId);
+          deps.onAgentTaskComplete(task.taskId, agent.slug, `Error: ${msg}`);
+
+          if (agent.model === "auto") {
+            session.destroy().catch(() => {});
+          }
         });
 
-        return `Task dispatched to worker '${args.name}'. I'll notify you when it's done.`;
+        const model = agent.model === "auto"
+          ? (args.model_override || "claude-sonnet-4.6")
+          : agent.model;
+        return `Task delegated to @${agent.slug} (${model}). Task ID: ${task.taskId}. I'll notify you when it's done.`;
       },
     }),
 
-    defineTool("list_sessions", {
-      description: "List all active worker sessions with their name, status, and working directory.",
+    defineTool("check_agent_status", {
+      description: "Check the status of an agent or a specific delegated task.",
+      parameters: z.object({
+        agent_name: z.string().optional().describe("Agent name/slug to check"),
+        task_id: z.string().optional().describe("Specific task ID to check"),
+      }),
+      handler: async (args) => {
+        if (args.task_id) {
+          const task = getTask(args.task_id);
+          if (!task) return `Task '${args.task_id}' not found.`;
+          const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
+          let info = `Task ${task.taskId} (@${task.agentSlug})\nStatus: ${task.status}\nDescription: ${task.description}\nElapsed: ${elapsed}s`;
+          if (task.result) info += `\n\nResult:\n${task.result.slice(0, 2000)}`;
+          return info;
+        }
+
+        if (args.agent_name) {
+          const agent = getAgent(args.agent_name);
+          if (!agent) return `Agent '${args.agent_name}' not found.`;
+          const status = getAgentSessionStatus(agent.slug);
+          let info = `@${agent.slug} (${agent.name})\nModel: ${agent.model}\nSession: ${status.hasSession ? "active" : "not started"}`;
+          if (status.tasks.length > 0) {
+            info += `\n\nActive tasks (${status.tasks.length}):`;
+            for (const t of status.tasks) {
+              info += `\n• ${t.taskId}: ${t.description} (${t.status})`;
+            }
+          }
+          return info;
+        }
+
+        // Show all agents
+        const agents = getAgentRegistry();
+        const lines = agents.map((a) => {
+          const status = getAgentSessionStatus(a.slug);
+          const runningTasks = status.tasks.filter((t) => t.status === "running");
+          const sessionBadge = status.hasSession ? "●" : "○";
+          const taskInfo = runningTasks.length > 0 ? ` (${runningTasks.length} task(s) running)` : "";
+          return `${sessionBadge} @${a.slug} — ${a.description} [${a.model}]${taskInfo}`;
+        });
+        return `Agents (${agents.length}):\n${lines.join("\n")}`;
+      },
+    }),
+
+    defineTool("get_agent_result", {
+      description: "Get the result of a completed agent task.",
+      parameters: z.object({
+        task_id: z.string().describe("The task ID (from delegate_to_agent)"),
+      }),
+      handler: async (args) => {
+        const task = getTask(args.task_id);
+        if (!task) {
+          // Check DB for completed tasks that may have been cleared from memory
+          const db = getDb();
+          const row = db.prepare(`SELECT * FROM agent_tasks WHERE task_id = ?`).get(args.task_id) as any;
+          if (!row) return `Task '${args.task_id}' not found.`;
+          return `Task ${row.task_id} (@${row.agent_slug})\nStatus: ${row.status}\nDescription: ${row.description}\n\nResult:\n${row.result || "(no result)"}`;
+        }
+        if (task.status === "running") {
+          const elapsed = Math.round((Date.now() - task.startedAt) / 1000);
+          return `Task ${task.taskId} is still running (${elapsed}s elapsed).`;
+        }
+        return `Task ${task.taskId} (@${task.agentSlug}) — ${task.status}\n\nResult:\n${task.result || "(no result)"}`;
+      },
+    }),
+
+    defineTool("list_agents", {
+      description: "List all registered agents with their name, model, status, and current tasks.",
       parameters: z.object({}),
       handler: async () => {
-        if (deps.workers.size === 0) {
-          return "No active worker sessions.";
-        }
-        const lines = Array.from(deps.workers.values()).map(
-          (w) => `• ${w.name} (${w.workingDir}) — ${w.status}`
+        const agents = getAgentRegistry();
+        if (agents.length === 0) return "No agents registered.";
+
+        const lines = agents.map((a) => {
+          const status = getAgentSessionStatus(a.slug);
+          const badge = status.hasSession ? "● active" : "○ idle";
+          const tasks = status.tasks.filter((t) => t.status === "running");
+          const taskInfo = tasks.length > 0
+            ? `\n    Tasks: ${tasks.map((t) => `${t.taskId}: ${t.description}`).join(", ")}`
+            : "";
+          return `• @${a.slug} (${a.name}) — ${a.model} — ${badge}${taskInfo}\n  ${a.description}`;
+        });
+        return `Registered agents (${agents.length}):\n${lines.join("\n")}`;
+      },
+    }),
+
+    defineTool("hire_agent", {
+      description:
+        "Create a new custom agent by writing an .agent.md file to ~/.max/agents/. " +
+        "The agent will be available immediately after creation.",
+      parameters: z.object({
+        slug: z.string().regex(/^[a-z0-9]+(-[a-z0-9]+)*$/).describe("Kebab-case identifier, e.g. 'data-analyst'"),
+        name: z.string().describe("Human-readable name"),
+        description: z.string().describe("One-line description of the agent's specialty"),
+        model: z.string().describe("Model to use (e.g. 'claude-sonnet-4.6', 'gpt-5.4', or 'auto')"),
+        system_prompt: z.string().describe("The agent's system prompt (markdown)"),
+        skills: z.array(z.string()).optional().describe("Skills to attach to this agent"),
+        tools: z.array(z.string()).optional().describe("Tool allowlist (omit for all execution tools)"),
+      }),
+      handler: async (args) => {
+        const err = createAgentFile(
+          args.slug, args.name, args.description, args.model,
+          args.system_prompt, args.skills, args.tools
         );
-        return `Active sessions:\n${lines.join("\n")}`;
+        if (err) return err;
+        // Reload registry
+        loadAgents();
+        return `Agent @${args.slug} created. It's ready for delegation.`;
       },
     }),
 
-    defineTool("check_session_status", {
-      description: "Get detailed status of a specific worker session, including its last output.",
+    defineTool("fire_agent", {
+      description: "Remove a custom agent's .agent.md file and destroy its session. Cannot remove built-in agents.",
       parameters: z.object({
-        name: z.string().describe("Name of the worker session"),
+        slug: z.string().describe("The agent slug to remove"),
       }),
       handler: async (args) => {
-        const worker = deps.workers.get(args.name);
-        if (!worker) {
-          return `No worker named '${args.name}'.`;
-        }
-        const output = worker.lastOutput
-          ? `\n\nLast output:\n${worker.lastOutput.slice(0, 2000)}`
-          : "";
-        return `Worker '${args.name}'\nDirectory: ${worker.workingDir}\nStatus: ${worker.status}${output}`;
-      },
-    }),
-
-    defineTool("kill_session", {
-      description: "Terminate a worker session and free its resources.",
-      parameters: z.object({
-        name: z.string().describe("Name of the worker session to kill"),
-      }),
-      handler: async (args) => {
-        const worker = deps.workers.get(args.name);
-        if (!worker) {
-          return `No worker named '${args.name}'.`;
-        }
-        try {
-          await worker.session.destroy();
-        } catch {
-          // Session may already be gone
-        }
-        deps.workers.delete(args.name);
-
-        const db = getDb();
-        db.prepare(`DELETE FROM worker_sessions WHERE name = ?`).run(args.name);
-
-        return `Worker '${args.name}' terminated.`;
+        const err = removeAgentFile(args.slug);
+        if (err) return err;
+        await destroyAgentSession(args.slug);
+        loadAgents();
+        return `Agent @${args.slug} removed.`;
       },
     }),
 
@@ -337,38 +322,25 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
     defineTool("attach_machine_session", {
       description:
         "Attach to an existing Copilot CLI session on this machine (e.g. one started from VS Code or terminal). " +
-        "Resumes the session and adds it as a managed worker so you can send prompts to it.",
+        "Resumes the session so you can observe or interact with it.",
       parameters: z.object({
         session_id: z.string().describe("The session ID to attach to (from list_machine_sessions)"),
         name: z.string().describe("A short name to reference this session by, e.g. 'vscode-main'"),
       }),
       handler: async (args) => {
-        if (deps.workers.has(args.name)) {
-          return `A worker named '${args.name}' already exists. Choose a different name.`;
-        }
-
         try {
           const session = await deps.client.resumeSession(args.session_id, {
             model: config.copilotModel,
             onPermissionRequest: approveAll,
           });
 
-          const worker: WorkerInfo = {
-            name: args.name,
-            session,
-            workingDir: "(attached)",
-            status: "idle",
-            originChannel: getCurrentSourceChannel(),
-          };
-          deps.workers.set(args.name, worker);
-
           const db = getDb();
           db.prepare(
-            `INSERT OR REPLACE INTO worker_sessions (name, copilot_session_id, working_dir, status)
-             VALUES (?, ?, '(attached)', 'idle')`
-          ).run(args.name, args.session_id);
+            `INSERT OR REPLACE INTO agent_sessions (slug, copilot_session_id, model, status)
+             VALUES (?, ?, ?, 'idle')`
+          ).run(args.name, args.session_id, config.copilotModel);
 
-          return `Attached to session ${args.session_id.slice(0, 8)}… as worker '${args.name}'. You can now send_to_worker to interact with it.`;
+          return `Attached to session ${args.session_id.slice(0, 8)}… as '${args.name}'.`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           return `Failed to attach to session: ${msg}`;

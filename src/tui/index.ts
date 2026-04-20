@@ -731,14 +731,14 @@ function sendCancel(): void {
 }
 
 // ── Command handlers ──────────────────────────────────────
-function cmdWorkers(): void {
-  apiGet("/sessions", (sessions: any[]) => {
-    if (!sessions || sessions.length === 0) {
-      console.log(C.dim("  No active worker sessions.\n"));
+function cmdAgents(): void {
+  apiGet("/agents", (agents: any[]) => {
+    if (!agents || agents.length === 0) {
+      console.log(C.dim("  No agents configured.\n"));
     } else {
-      for (const s of sessions) {
-        const badge = s.status === "idle" ? C.green("● idle") : C.yellow("● busy");
-        console.log(`  ${badge}  ${C.bold(s.name)}  ${C.dim(s.workingDir)}`);
+      for (const a of agents) {
+        const badge = a.active ? C.green("● active") : C.dim("○ idle");
+        console.log(`  ${badge}  ${C.bold("@" + a.slug)}  ${C.dim(a.model)}  ${C.dim(a.description || "")}`);
       }
       console.log();
     }
@@ -884,7 +884,7 @@ function cmdHelp(): void {
   console.log(`    ${C.coral("/auto")}                 toggle auto model routing`);
   console.log(`    ${C.coral("/memory")}               show stored memories`);
   console.log(`    ${C.coral("/skills")}               list installed skills`);
-  console.log(`    ${C.coral("/workers")}              list active sessions`);
+  console.log(`    ${C.coral("/agents")}               list available agents`);
   console.log(`    ${C.coral("/copy")}                 copy last response`);
   console.log(`    ${C.coral("/status")}               daemon health check`);
   console.log(`    ${C.coral("/restart")}              restart daemon`);
@@ -971,7 +971,7 @@ setTimeout(() => {
     }
 
     if (trimmed === "/cancel") { sendCancel(); return; }
-    if (trimmed === "/sessions" || trimmed === "/workers") { cmdWorkers(); return; }
+    if (trimmed === "/agents" || trimmed === "/sessions" || trimmed === "/workers") { cmdAgents(); return; }
     if (trimmed === "/models") { cmdModels(); return; }
     if (trimmed.startsWith("/model")) { cmdModel(trimmed.slice(6).trim()); return; }
     if (trimmed === "/auto") { cmdAuto(); return; }

@@ -23,6 +23,30 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'idle',
+        current_task TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_tasks (
+        task_id TEXT PRIMARY KEY,
+        agent_slug TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        result TEXT,
+        origin_channel TEXT,
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME
+      )
+    `);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS max_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
