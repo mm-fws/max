@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import { z } from "zod";
 import { approveAll, type CopilotClient, type CopilotSession, type Tool } from "@github/copilot-sdk";
 import { AGENTS_DIR, SESSIONS_DIR } from "../paths.js";
+import { getState, setState } from "../store/db.js";
 import { loadMcpConfig } from "./mcp-config.js";
 import { getSkillDirectories } from "./skills.js";
 
@@ -161,7 +162,8 @@ export function getAgentRegistry(): AgentConfig[] {
   return [...agentRegistry];
 }
 
-/** Copy bundled agents to ~/.max/agents/, updating stale copies when the bundled version changes. */
+/** Copy bundled agents to ~/.max/agents/, updating stale copies when the bundled version changes.
+ *  Respects user customizations: if the user edited the deployed file after our last sync, we skip it. */
 export function ensureDefaultAgents(): void {
   mkdirSync(AGENTS_DIR, { recursive: true });
 
@@ -177,18 +179,33 @@ export function ensureDefaultAgents(): void {
   for (const file of bundled) {
     const src = join(BUNDLED_AGENTS_DIR, file);
     const dest = join(AGENTS_DIR, file);
+    const srcHash = createHash("sha256").update(readFileSync(src)).digest("hex");
+    const stateKey = `bundled_agent_hash:${file}`;
+
     if (!existsSync(dest)) {
       copyFileSync(src, dest);
+      setState(stateKey, srcHash);
       console.log(`[agents] Installed bundled agent: ${file}`);
-    } else {
-      // Update if the bundled version has changed (compare content hashes)
-      const srcHash = createHash("sha256").update(readFileSync(src)).digest("hex");
-      const destHash = createHash("sha256").update(readFileSync(dest)).digest("hex");
-      if (srcHash !== destHash) {
-        copyFileSync(src, dest);
-        console.log(`[agents] Updated bundled agent: ${file}`);
-      }
+      continue;
     }
+
+    // Check if the bundled version actually changed since our last sync
+    const lastSyncedHash = getState(stateKey);
+    if (lastSyncedHash === srcHash) continue; // bundled hasn't changed
+
+    // Bundled version changed — only overwrite if the user hasn't customized it.
+    // If we have a record of what we last deployed, check if the file still matches.
+    const destHash = createHash("sha256").update(readFileSync(dest)).digest("hex");
+    if (lastSyncedHash && destHash !== lastSyncedHash) {
+      // User modified the file after our last sync — don't clobber their changes
+      console.log(`[agents] Skipping ${file} — user has local customizations`);
+      continue;
+    }
+
+    // Safe to update: either first sync (no record) or file is unmodified from our last deploy
+    copyFileSync(src, dest);
+    setState(stateKey, srcHash);
+    console.log(`[agents] Updated bundled agent: ${file}`);
   }
 }
 
