@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, mkdirSync, writeFileSync, existsSync, rmSync, copyFileSync } from "fs";
+import { createHash } from "crypto";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { z } from "zod";
@@ -160,7 +161,7 @@ export function getAgentRegistry(): AgentConfig[] {
   return [...agentRegistry];
 }
 
-/** Copy bundled agents to ~/.max/agents/ if they don't already exist. */
+/** Copy bundled agents to ~/.max/agents/, updating stale copies when the bundled version changes. */
 export function ensureDefaultAgents(): void {
   mkdirSync(AGENTS_DIR, { recursive: true });
 
@@ -174,10 +175,19 @@ export function ensureDefaultAgents(): void {
   }
 
   for (const file of bundled) {
+    const src = join(BUNDLED_AGENTS_DIR, file);
     const dest = join(AGENTS_DIR, file);
     if (!existsSync(dest)) {
-      copyFileSync(join(BUNDLED_AGENTS_DIR, file), dest);
+      copyFileSync(src, dest);
       console.log(`[agents] Installed bundled agent: ${file}`);
+    } else {
+      // Update if the bundled version has changed (compare content hashes)
+      const srcHash = createHash("sha256").update(readFileSync(src)).digest("hex");
+      const destHash = createHash("sha256").update(readFileSync(dest)).digest("hex");
+      if (srcHash !== destHash) {
+        copyFileSync(src, dest);
+        console.log(`[agents] Updated bundled agent: ${file}`);
+      }
     }
   }
 }
