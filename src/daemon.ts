@@ -11,6 +11,7 @@ import { checkForUpdate } from "./update.js";
 import { ensureWikiStructure } from "./wiki/fs.js";
 import { shouldMigrate, migrateMemoriesToWiki, shouldReorganize, reorganizeWiki } from "./wiki/migrate.js";
 import { SESSIONS_DIR } from "./paths.js";
+import { startAdoPoller, stopAdoPoller } from "./ado/poller.js";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -132,6 +133,9 @@ async function main(): Promise<void> {
 
   console.log("[max] Max is fully operational.");
 
+  // Start ADO PR poller (no-op if not configured)
+  startAdoPoller();
+
   // Non-blocking update check
   checkForUpdate()
     .then(({ updateAvailable, current, latest }) => {
@@ -181,6 +185,9 @@ async function shutdown(): Promise<void> {
     try { await stopBot(); } catch { /* best effort */ }
   }
 
+  // Stop ADO poller
+  stopAdoPoller();
+
   // Destroy all active agent sessions
   await shutdownAgents();
 
@@ -203,6 +210,9 @@ export async function restartDaemon(): Promise<void> {
     await sendProactiveMessage("Restarting — back in a sec ⏳").catch(() => {});
     try { await stopBot(); } catch { /* best effort */ }
   }
+
+  // Stop ADO poller before restart
+  stopAdoPoller();
 
   // Destroy all active agent sessions
   await shutdownAgents();

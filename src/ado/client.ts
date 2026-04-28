@@ -266,3 +266,52 @@ export async function getPrDiff(
 
   return results;
 }
+
+// ---------------------------------------------------------------------------
+// PR listing
+// ---------------------------------------------------------------------------
+
+/** Minimal info about an open pull request, as returned by listOpenPrs. */
+export interface PrSummary {
+  id: number;
+  title: string;
+  createdBy: string;
+  sourceRefName: string;
+  targetRefName: string;
+  status: string;
+}
+
+/**
+ * List all active (open) pull requests in a repository.
+ */
+export async function listOpenPrs(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  pat: string
+): Promise<PrSummary[]> {
+  const url =
+    `${orgUrl.replace(/\/$/, "")}/${encodeURIComponent(project)}/_apis/git/repositories/` +
+    `${encodeURIComponent(repo)}/pullRequests?searchCriteria.status=active&api-version=7.1`;
+
+  const data = (await adoRequest(url, pat, "GET")) as {
+    value?: Array<{
+      pullRequestId: number;
+      title: string;
+      createdBy?: { displayName?: string };
+      sourceRefName: string;
+      targetRefName: string;
+      status: string;
+    }>;
+  };
+
+  return (data?.value ?? []).map((pr) => ({
+    id: pr.pullRequestId,
+    title: pr.title,
+    createdBy: pr.createdBy?.displayName ?? "unknown",
+    sourceRefName: pr.sourceRefName,
+    targetRefName: pr.targetRefName,
+    status: pr.status,
+  }));
+}
+
