@@ -210,7 +210,8 @@ export async function getPrDiff(
     if (!path) continue;
 
     // changeType flags: 1=add, 2=edit, 4=delete, others=rename/copy
-    const rawType = entry.changeType & 7; // mask to lower 3 bits
+    // ADO uses a bitmask; masking to the lower 3 bits isolates the primary operation.
+    const rawType = entry.changeType & 7; // 0b111 — lower 3 bits encode add/edit/delete
     let changeType: "add" | "modify" | "delete";
     if (rawType === 1) changeType = "add";
     else if (rawType === 4) changeType = "delete";
