@@ -47,6 +47,9 @@ const VOTE_MAP: Record<string, number> = {
   reject: -10,
 };
 
+/** Bitmask for the lower 3 bits of ADO's changeType field (add=1, edit=2, delete=4). */
+const CHANGE_TYPE_MASK = 0b111;
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -211,7 +214,7 @@ export async function getPrDiff(
 
     // changeType flags: 1=add, 2=edit, 4=delete, others=rename/copy
     // ADO uses a bitmask; masking to the lower 3 bits isolates the primary operation.
-    const rawType = entry.changeType & 7; // 0b111 — lower 3 bits encode add/edit/delete
+    const rawType = entry.changeType & CHANGE_TYPE_MASK;
     let changeType: "add" | "modify" | "delete";
     if (rawType === 1) changeType = "add";
     else if (rawType === 4) changeType = "delete";
