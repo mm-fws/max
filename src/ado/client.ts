@@ -5,6 +5,7 @@
  *   - postPrComment   — post a PR-level or inline-thread comment
  *   - castPrVote      — submit a reviewer vote on a PR
  *   - getPrDiff       — fetch a structured diff for a PR
+ *   - listPrComments  — list all human comment threads on a PR
  */
 
 // ---------------------------------------------------------------------------
@@ -316,5 +317,71 @@ export async function listOpenPrs(
     targetRefName: pr.targetRefName,
     status: pr.status,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// PR comment listing
+// ---------------------------------------------------------------------------
+
+/** A single human-authored comment within a PR thread. */
+export interface PrComment {
+  threadId: number;
+  commentId: number;
+  content: string;
+  author: string;
+  publishedDate: string;
+}
+
+/**
+ * List all non-deleted, human-authored comments across all threads of a PR.
+ *
+ * System-generated threads (commentType !== 1) and deleted comments are
+ * filtered out so only real reviewer/author comments are returned.
+ */
+export async function listPrComments(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  prId: number,
+  pat: string
+): Promise<PrComment[]> {
+  const url =
+    `${orgUrl.replace(/\/$/, "")}/${encodeURIComponent(project)}/_apis/git/repositories/` +
+    `${encodeURIComponent(repo)}/pullRequests/${prId}/threads?api-version=7.1`;
+
+  const data = (await adoRequest(url, pat, "GET")) as {
+    value?: Array<{
+      id: number;
+      comments?: Array<{
+        id: number;
+        content?: string;
+        author?: { displayName?: string };
+        publishedDate?: string;
+        isDeleted?: boolean;
+        commentType?: number;
+      }>;
+    }>;
+  };
+
+  const results: PrComment[] = [];
+
+  for (const thread of data?.value ?? []) {
+    for (const comment of thread.comments ?? []) {
+      // commentType 1 = regular text comment; other values are system events
+      if (comment.commentType !== 1) continue;
+      if (comment.isDeleted) continue;
+      if (!comment.content) continue;
+
+      results.push({
+        threadId: thread.id,
+        commentId: comment.id,
+        content: comment.content,
+        author: comment.author?.displayName ?? "unknown",
+        publishedDate: comment.publishedDate ?? "",
+      });
+    }
+  }
+
+  return results;
 }
 
