@@ -13,6 +13,11 @@ const configSchema = z.object({
   API_PORT: z.string().optional(),
   COPILOT_MODEL: z.string().optional(),
   WORKER_TIMEOUT: z.string().optional(),
+  ADO_ORG_URL: z.string().min(1).optional(),
+  ADO_PAT: z.string().min(1).optional(),
+  ADO_REVIEWER_ID: z.string().min(1).optional(),
+  ADO_REPOS: z.string().min(1).optional(),
+  ADO_POLL_INTERVAL_MS: z.string().optional(),
 });
 
 const raw = configSchema.parse(process.env);
@@ -38,6 +43,26 @@ if (!Number.isInteger(parsedWorkerTimeout) || parsedWorkerTimeout <= 0) {
   throw new Error(`WORKER_TIMEOUT must be a positive integer (ms), got: "${raw.WORKER_TIMEOUT}"`);
 }
 
+const DEFAULT_ADO_POLL_INTERVAL_MS = 60_000; // 1 minute
+const parsedAdoPollInterval = raw.ADO_POLL_INTERVAL_MS
+  ? Number(raw.ADO_POLL_INTERVAL_MS)
+  : DEFAULT_ADO_POLL_INTERVAL_MS;
+
+// ADO_REPOS: comma-separated list of "project/repo" pairs, e.g. "MyProject/my-repo,OtherProject/other-repo"
+const parsedAdoRepos: Array<{ project: string; repo: string }> = [];
+if (raw.ADO_REPOS) {
+  for (const entry of raw.ADO_REPOS.split(",")) {
+    const trimmed = entry.trim();
+    const slashIdx = trimmed.indexOf("/");
+    if (slashIdx > 0) {
+      parsedAdoRepos.push({
+        project: trimmed.slice(0, slashIdx).trim(),
+        repo: trimmed.slice(slashIdx + 1).trim(),
+      });
+    }
+  }
+}
+
 export const DEFAULT_MODEL = "claude-sonnet-4.6";
 
 let _copilotModel = raw.COPILOT_MODEL || DEFAULT_MODEL;
@@ -47,6 +72,12 @@ export const config = {
   authorizedUserId: parsedUserId,
   apiPort: parsedPort,
   workerTimeoutMs: parsedWorkerTimeout,
+  /** ADO integration */
+  adoOrgUrl: raw.ADO_ORG_URL,
+  adoPat: raw.ADO_PAT,
+  adoReviewerId: raw.ADO_REVIEWER_ID,
+  adoRepos: parsedAdoRepos,
+  adoPollIntervalMs: parsedAdoPollInterval,
   get copilotModel(): string {
     return _copilotModel;
   },
@@ -55,6 +86,9 @@ export const config = {
   },
   get telegramEnabled(): boolean {
     return !!this.telegramBotToken && this.authorizedUserId !== undefined;
+  },
+  get adoEnabled(): boolean {
+    return !!(this.adoOrgUrl && this.adoPat && this.adoRepos.length > 0);
   },
   get selfEditEnabled(): boolean {
     return process.env.MAX_SELF_EDIT === "1";

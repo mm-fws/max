@@ -53,6 +53,17 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS ado_reviewed_prs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_url TEXT NOT NULL,
+        project TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        pr_id INTEGER NOT NULL,
+        reviewed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(org_url, project, repo, pr_id)
+      )
+    `);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS conversation_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
@@ -188,6 +199,39 @@ export function getRecentConversation(limit = 20): string {
 // The memories table and FTS5 index are preserved in the schema for safety
 // (existing data is not deleted), but no code reads or writes to them.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ADO PR review deduplication
+// ---------------------------------------------------------------------------
+
+/** Return true if this PR has already been reviewed (exists in ado_reviewed_prs). */
+export function hasPrBeenReviewed(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  prId: number
+): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT 1 FROM ado_reviewed_prs WHERE org_url = ? AND project = ? AND repo = ? AND pr_id = ?`
+    )
+    .get(orgUrl, project, repo, prId);
+  return row !== undefined;
+}
+
+/** Mark a PR as reviewed so the poller won't trigger it again. */
+export function markPrReviewed(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  prId: number
+): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO ado_reviewed_prs (org_url, project, repo, pr_id) VALUES (?, ?, ?, ?)`
+  ).run(orgUrl, project, repo, prId);
+}
 
 export function closeDb(): void {
   if (db) {

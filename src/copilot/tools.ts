@@ -19,6 +19,7 @@ import {
   createAgentFile, removeAgentFile, loadAgents,
   type AgentConfig, type AgentTaskInfo,
 } from "./agents.js";
+import { createAdoTools } from "../ado/tools.js";
 
 function getCategoryDir(category: string): string {
   const map: Record<string, string> = {
@@ -989,6 +990,9 @@ export function createTools(deps: ToolDeps): Tool<any>[] {
         return `Restarting Max${reason}. I'll be back in a few seconds.`;
       },
     }),
+
+    // ----- Azure DevOps PR review tools -----
+    ...createAdoTools(),
   ];
 }
 
