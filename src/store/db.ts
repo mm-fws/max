@@ -64,6 +64,19 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS ado_fix_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_url TEXT NOT NULL,
+        project TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        pr_id INTEGER NOT NULL,
+        thread_id INTEGER NOT NULL,
+        comment_id INTEGER NOT NULL,
+        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(org_url, project, repo, pr_id, thread_id, comment_id)
+      )
+    `);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS conversation_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
@@ -231,6 +244,43 @@ export function markPrReviewed(
   db.prepare(
     `INSERT OR IGNORE INTO ado_reviewed_prs (org_url, project, repo, pr_id) VALUES (?, ?, ?, ?)`
   ).run(orgUrl, project, repo, prId);
+}
+
+// ---------------------------------------------------------------------------
+// ADO /max:fix comment deduplication
+// ---------------------------------------------------------------------------
+
+/** Return true if this PR comment has already been processed as a /max:fix trigger. */
+export function hasFixCommentBeenProcessed(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  prId: number,
+  threadId: number,
+  commentId: number
+): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT 1 FROM ado_fix_comments WHERE org_url = ? AND project = ? AND repo = ? AND pr_id = ? AND thread_id = ? AND comment_id = ?`
+    )
+    .get(orgUrl, project, repo, prId, threadId, commentId);
+  return row !== undefined;
+}
+
+/** Mark a /max:fix comment as processed so it won't trigger the coder again. */
+export function markFixCommentProcessed(
+  orgUrl: string,
+  project: string,
+  repo: string,
+  prId: number,
+  threadId: number,
+  commentId: number
+): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO ado_fix_comments (org_url, project, repo, pr_id, thread_id, comment_id) VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(orgUrl, project, repo, prId, threadId, commentId);
 }
 
 export function closeDb(): void {
