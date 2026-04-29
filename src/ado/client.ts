@@ -330,6 +330,12 @@ export interface PrComment {
   content: string;
   author: string;
   publishedDate: string;
+  /** If the thread is anchored to a file/line, this captures the location. */
+  threadContext?: {
+    filePath: string;
+    startLine: number;
+    endLine: number;
+  };
 }
 
 /**
@@ -352,13 +358,20 @@ export async function listPrComments(
   const data = (await adoRequest(url, pat, "GET")) as {
     value?: Array<{
       id: number;
+      threadContext?: {
+        filePath?: string;
+        rightFileStart?: { line: number };
+        rightFileEnd?: { line: number };
+        leftFileStart?: { line: number };
+        leftFileEnd?: { line: number };
+      };
       comments?: Array<{
         id: number;
         content?: string;
         author?: { displayName?: string };
         publishedDate?: string;
         isDeleted?: boolean;
-        commentType?: number;
+        commentType?: string;
       }>;
     }>;
   };
@@ -367,10 +380,28 @@ export async function listPrComments(
 
   for (const thread of data?.value ?? []) {
     for (const comment of thread.comments ?? []) {
-      // commentType 1 = regular text comment; other values are system events
-      if (comment.commentType !== 1) continue;
+      // commentType 'text' = regular text comment; other values are system events
+      if (comment.commentType !== 'text') continue;
       if (comment.isDeleted) continue;
       if (!comment.content) continue;
+
+      // Extract inline thread context (file + line range) if present.
+      let threadContext: PrComment["threadContext"];
+      if (thread.threadContext?.filePath) {
+        const startLine =
+          thread.threadContext.rightFileStart?.line ??
+          thread.threadContext.leftFileStart?.line ??
+          1;
+        const endLine =
+          thread.threadContext.rightFileEnd?.line ??
+          thread.threadContext.leftFileEnd?.line ??
+          startLine;
+        threadContext = {
+          filePath: thread.threadContext.filePath,
+          startLine,
+          endLine,
+        };
+      }
 
       results.push({
         threadId: thread.id,
@@ -378,6 +409,7 @@ export async function listPrComments(
         content: comment.content,
         author: comment.author?.displayName ?? "unknown",
         publishedDate: comment.publishedDate ?? "",
+        threadContext,
       });
     }
   }

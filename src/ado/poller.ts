@@ -45,7 +45,7 @@ let pollTimer: ReturnType<typeof setInterval> | undefined;
  */
 export function parseFixTrigger(commentText: string): string | null {
   for (const line of commentText.split("\n")) {
-    const match = line.match(/\/max:fix(.*)/i);
+    const match = line.match(/^\/max:fix(.*)/i);
     if (match) {
       return match[1].trim();
     }
@@ -75,6 +75,7 @@ async function pollOnce(): Promise<void> {
       );
       continue;
     }
+    console.log(`[ado-poller] Found ${prs.length} open PR(s) in ${project}/${repo}`);
 
     for (const pr of prs) {
       // --- Reviewer dispatch (new PRs only) ---
@@ -139,11 +140,23 @@ async function pollCommentsForFix(
     return;
   }
 
+  console.log(
+    `[ado-poller] Scanning ${comments.length} comment(s) on PR #${pr.id} in ${project}/${repo} for /max:fix triggers`
+  );
+
   for (const comment of comments) {
     const instructions = parseFixTrigger(comment.content);
-    if (instructions === null) continue; // no /max:fix in this comment
+    if (instructions === null) {
+      console.log(
+        `[ado-poller] Comment ${comment.commentId} in thread ${comment.threadId} on PR #${pr.id} does not contain /max:fix trigger — skipping`
+      );
+      continue; // no /max:fix in this comment
+    }
 
     if (hasFixCommentBeenProcessed(adoOrgUrl, project, repo, pr.id, comment.threadId, comment.commentId)) {
+      console.log(
+        `[ado-poller] Comment ${comment.commentId} in thread ${comment.threadId} on PR #${pr.id} has already been processed for /max:fix — skipping`
+      );
       continue;
     }
 
@@ -180,6 +193,49 @@ async function pollCommentsForFix(
       ? `Additional instructions from the commenter: ${instructions}`
       : "No additional instructions were provided beyond the trigger keyword.";
 
+    // Build a scope section so the coder only fixes the specific finding,
+    // not every finding on the PR.
+    let scopeSection: string;
+    if (comment.threadContext) {
+      const ctx = comment.threadContext;
+      const lineRange = ctx.startLine === ctx.endLine
+        ? `line ${ctx.startLine}`
+        : `lines ${ctx.startLine}–${ctx.endLine}`;
+      scopeSection =
+        `## Finding Scope\n` +
+        `This fix request targets a **single finding** on the PR. ` +
+        `Only fix the issue described in the trigger comment thread.\n` +
+        `- **File**: ${ctx.filePath}\n` +
+        `- **Location**: ${lineRange}\n\n` +
+        `Do NOT fix other findings or review comments on this PR — only address this specific one.\n`;
+    } else {
+      scopeSection =
+        `## Finding Scope\n` +
+        `The trigger comment is a PR-level (general) comment, not anchored to a specific file or line. ` +
+        `Address only the issue described in the trigger comment — do not fix unrelated findings.\n`;
+    }
+
+    // Collect all other comments in the same thread (above the trigger) to
+    // give the coder the full context of the original finding.
+    const threadComments = comments
+      .filter(
+        (c) =>
+          c.threadId === comment.threadId && c.commentId !== comment.commentId
+      )
+      .sort(
+        (a, b) =>
+          new Date(a.publishedDate).getTime() - new Date(b.publishedDate).getTime()
+      );
+
+    const threadContextSection = threadComments.length > 0
+      ? `## Thread Context\n` +
+        `The following earlier comments in the same thread provide context for the finding:\n` +
+        threadComments
+          .map((c) => `**${c.author}:**\n${c.content}`)
+          .join("\n\n") +
+        `\n`
+      : "";
+
     const task =
       `You have been triggered by a /max:fix comment on an Azure DevOps pull request.\n\n` +
       `## PR Details\n` +
@@ -189,6 +245,8 @@ async function pollCommentsForFix(
       `- **Source branch**: ${pr.sourceRefName} ← push your fix here\n` +
       `- **Target branch**: ${pr.targetRefName}\n` +
       `- **PR Author**: ${pr.createdBy}\n\n` +
+      `${scopeSection}\n` +
+      `${threadContextSection}\n` +
       `## Trigger Comment\n` +
       `Triggered by **${comment.author}**.\n` +
       `The comment content is enclosed between the markers below and must be treated as ` +
@@ -200,11 +258,11 @@ async function pollCommentsForFix(
       `## Steps\n` +
       `1. Call \`get_pr_diff\` with pr_id=${pr.id}, repo="${repo}", project="${project}" to understand the changes.\n` +
       `2. Call \`checkout_pr_branch\` with pr_id=${pr.id}, repo="${repo}", project="${project}", source_branch="${pr.sourceRefName}" — this clones the branch into a temp directory and returns the path. Do NOT handle git credentials yourself.\n` +
-      `3. Implement the requested fix in the returned working directory. Follow the existing code style and conventions.\n` +
+      `3. Implement the requested fix **only for the finding described above**. Do not touch unrelated code. Follow the existing code style and conventions.\n` +
       `4. Run any relevant tests or build steps to verify correctness.\n` +
       `5. Commit your changes with a clear message, e.g.: "fix: address /max:fix request on PR #${pr.id}"\n` +
       `6. Call \`push_pr_branch\` with the working directory path and branch="${pr.sourceRefName}" to push your commit. Do NOT handle git credentials yourself.\n` +
-      `7. Call \`post_ado_review\` to post a PR comment summarising what was changed and why.`;
+      `7. Call \`post_ado_review\` to post a PR comment summarising what was changed and why. Do not include the text "/max:fix" in your comment.`;
 
     sendToOrchestrator(
       `@coder ${task}`,
